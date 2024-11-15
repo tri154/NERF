@@ -7,10 +7,7 @@ def test():
 
 
 if __name__ == "__main__":
-    a = tc.rand(3, 4)
-    c = tc.cat((a, a), -1)
-    print(a)
-    print(c)
-
-    c[0][0] = -15
-    print(c)
+    t = tc.rand(10, 2, 100, 100, 3)
+    a = tc.rand(100, 100, 3, 1)
+    d = tc.cat((t, a), dim=1)
+    print(d.shape)

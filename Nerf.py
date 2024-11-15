@@ -13,8 +13,6 @@ import matplotlib.pyplot as plt
 devcie = tc.device("cuda" if tc.cuda.is_available() else "cpu")
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Model config:
-
 
 class NERF(nn.Module):
     def __init__(
@@ -87,13 +85,16 @@ class BlenderDataset(Dataset):
         imgs = []
         poses = []
         for frame in meta["frames"]:
-            imgs.append(
-                imageio.imread(os.path.join(self.basedir, frame["file_path"] + ".png"))
-            )
+            fn = os.path.join(self.basedir, frame["file_path"] + ".png")
+            img = imageio.imread(fn)
+            imgs.append(img)
             poses.append(np.array(frame["transform_matrix"]))
         self.poses = tc.from_numpy(np.array(poses).astype(np.float32))
-        # NOTE: four channels ?? is it be used ?
-        self.imgs = tc.from_numpy((np.array(imgs) / 255.0).astype(np.float32))
+        self.imgs = (np.array(imgs) / 255.0).astype(np.float32)
+        self.imgs = (255.0 * (1 - self.imgs[..., -1:])) + (
+            self.imgs[..., :-1] * self.imgs[..., -1:]
+        )
+        self.imgs = tc.from_numpy(self.imgs)
         self.H, self.W = imgs[0].shape[:2]
         camera_angle_x = float(meta["camera_angle_x"])
         self.focal = 0.5 * self.W / np.tan(0.5 * camera_angle_x)
@@ -107,5 +108,3 @@ class BlenderDataset(Dataset):
 
 if __name__ == "__main__":
     k = BlenderDataset()
-    print(k.poses.shape)
-    print(k.imgs.shape)
