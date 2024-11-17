@@ -7,8 +7,13 @@ def split():
     print("-----------")
 
 
+gb = 10
+
+
+class Test:
+    def __init__(self):
+        self.a = gb
+
+
 if __name__ == "__main__":
-    a = tc.arange(9).view(3, 3)
-    print(a)
-    split()
-    print(a[:, -1])
+    print(Test().a)

@@ -10,6 +10,43 @@ import imageio.v2 as imageio
 dvc = tc.device("cuda" if tc.cuda.is_available() else "cpu")
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# CONFIG
+# train
+n_iter = 10000
+
+
+#sampling
+n_coarse_samples = 6
+n_fine_samples = 
+near = 2
+far = 6
+
+# encoding 
+L_pts = 10
+L_viewdir = 4
+# coarse model
+c_hyperparameter = {
+    "n_l_net": 2,
+    "d_filter": 256,
+    "d_l_input": 3 * (1 + 2 * L_pts),
+    "l_skip": [],
+    "n_u_net": 1,
+    "d_u_filter": 128,
+    "d_u_input": 3 * (1 + 2 * L_viewdir),
+}
+
+
+# fine model
+f_hyperparameter = {
+    "n_l_net": 6,
+    "d_filter": 256,
+    "d_l_input": 3 * (1 + 2 * L_pts),
+    "l_skip": [4],
+    "n_u_net": 1,
+    "d_u_filter": 128,
+    "d_u_input": 3 * (1 + 2 * L_viewdir),
+}
+
 
 def get_rays(pose, W, H, focal):
     # TODO : optimize.
@@ -58,7 +95,7 @@ def get_rays(pose, W, H, focal):
 def sample_stratified(rays_o, rays_d, near, far, n_samples):
     """Sample along rays.
 
-    Paprameters
+    Parameters
     ___________
     rays_o: Tensor
         rays' origin.
@@ -70,7 +107,6 @@ def sample_stratified(rays_o, rays_d, near, far, n_samples):
     t_vals = tc.linspace(0.0, 1.0, n_samples, device=dvc)
     z_vals = near * (1 - t_vals) + far * t_vals  # n_samples
     z_vals = z_vals.expand(list(rays_d.shape[:-1]) + [n_samples])  # [W, H, n_samples]
-
     pts = (
         rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., None]
     )  # [W, H, N_samples, 3]
@@ -78,50 +114,68 @@ def sample_stratified(rays_o, rays_d, near, far, n_samples):
     return pts, z_vals
 
 
+def positional_encoding(pts, L):
+    """
+
+    Parameters
+    ___________
+
+    pst : Tensor
+        points to encode, expecting shape (N_points, 3)
+    L : scalar
+        a parameter in the formula.
+
+    Returns
+    _______
+
+    Tensor
+        encoded points, expecting shape (N_points, d_input * (1 + 2L).
+    """
+    lin = 2.0 ** tc.linspace(0.0, L - 1, L, device=dvc, dtype=pts.dtype)
+    encoding = [pts]
+    for freq in lin:
+        for fn in [tc.sin, tc.cos]:
+            encoding.append(fn(freq * pts))
+    return tc.cat(encoding, dim=-1)
+
+
 class NERF(nn.Module):
     """Nerf model implementation"""
 
-    def __init__(self, d_l_input, d_u_input):
+    def __init__(self, hyper):
         """The architecture from the source code of the paper."""
         super().__init__()
-        # Config.
-        self.n_l_net = 8
-        self.d_filter = 256
-        self.d_l_input = d_l_input
-        self.skip = [4]
-
-        self.n_u_net = 3
-        self.d_u_filter = int(self.d_filter / 2)
-        self.skip_u = []
-        self.d_u_input = d_u_input
+        self.hyper = hyper
 
         self.act = nn.functional.relu
-        layers = [nn.Linear(self.d_l_input, self.d_filter)]
+        layers = [nn.Linear(hyper["d_l_input"], hyper["d_filter"])]
         # lower layers
-        for i in range(1, self.n_l_net):
+        for i in range(1, hyper["n_l_net"]):
             layers.append(
-                nn.Linear(self.d_filter + self.d_l_input, self.d_filter)
-                if i in self.skip
-                else nn.Linear(self.d_filter, self.d_filter)
+                nn.Linear(hyper["d_filter"] + hyper["d_l_input"], hyper["d_filter"])
+                if i in hyper["l_skip"]
+                else nn.Linear(hyper["d_filter"], hyper["d_filter"])
             )
         self.low_lays = nn.ModuleList(layers)
 
         # upper layers
-        self.vox_unit = nn.Linear(self.d_filter, 1)
-        self.feat = nn.Linear(self.d_filter, self.d_filter)
+        self.vox_unit = nn.Linear(hyper["d_filter"], 1)
+        self.feat = nn.Linear(hyper["d_filter"], hyper["d_filter"])
         # assume view dir is 3d.
-        layers = [nn.Linear(self.d_filter + self.d_u_input, self.d_u_filter)]
-        for i in range(1, self.n_u_net):
-            layers.append(nn.Linear(self.d_u_filter, self.d_u_filter))
+        layers = [
+            nn.Linear(hyper["d_filter"] + hyper["d_u_input"], hyper["d_u_filter"])
+        ]
+        for i in range(1, hyper["n_u_net"]):
+            layers.append(nn.Linear(hyper["d_u_filter"], hyper["d_u_filter"]))
         self.up_layers = nn.ModuleList(layers)
 
-        self.rgb_unit = nn.Linear(self.d_u_filter, 3)
+        self.rgb_unit = nn.Linear(hyper["d_u_filter"], 3)
 
     # NOTE : whole batch or single rays ? that is whole batch.
     def forward(self, x, view_dir):
         """Forward path.
 
-        Paprameters
+        Parameters
         ___________
 
         x : Tensor
@@ -139,7 +193,7 @@ class NERF(nn.Module):
 
         x_ = x
         for i, layer in enumerate(self.low_lays):
-            if i in self.skip:
+            if i in self.hyper["l_skip"]:
                 x = layer(tc.cat((x, x_), dim=-1))
             else:
                 x = layer(x)
@@ -215,23 +269,27 @@ class BlenderDataset:
 
 
 def train():
-    # config
-    n_iter = 10000
-    near = 2
-    far = 6
-    n_coarse_sample = 6
-
-    # ------
-
+    # data
     dataset = BlenderDataset()
+
+    #model 
+    n =
+
     # run train.
     for _ in range(n_iter):
         img_idx = np.random.randint(len(dataset))
         gt_rgb, rays_o, rays_d = dataset[img_idx]
-        pts, z_vals = sample_stratified(rays_o, rays_d, near, far, n_coarse_sample)
 
 
 if __name__ == "__main__":
-    data = BlenderDataset()
-    imgs, rays_o, rays_d = data[0]
-    sample_stratified(rays_o, rays_d, 2, 6, 10)
+    # data = BlenderDataset()
+    # imgs, rays_o, rays_d = data[0]
+    # pts, z_vals = sample_stratified(rays_o, rays_d, near=2, far=6, n_samples=10)
+    # pts = pts.view(-1, 3)
+    # print(pts[0])
+    # print("_______________")
+    # encoding_pts = positional_encoding(pts, 3)
+    # print(encoding_pts[0])
+    # print(pts.shape)
+    # print(encoding_pts.shape)
+
