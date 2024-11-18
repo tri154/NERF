@@ -16,4 +16,9 @@ class Test:
 
 
 if __name__ == "__main__":
-    print(Test().a)
+    temp_t = tc.tensor([1e10])
+    dist = tc.rand(100, 3)
+    a = temp_t.expand(*dist.shape[:-1], 1)
+    b = temp_t.expand(dist[..., :1].shape)
+    print(a.shape)
+    print(b.shape)
