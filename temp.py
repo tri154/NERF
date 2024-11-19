@@ -6,6 +6,8 @@ import numpy as np
 def split():
     print("-----------")
 
+    print(a)
+
 
 gb = 10
 
@@ -16,9 +18,4 @@ class Test:
 
 
 if __name__ == "__main__":
-    temp_t = tc.tensor([1e10])
-    dist = tc.rand(100, 3)
-    a = temp_t.expand(*dist.shape[:-1], 1)
-    b = temp_t.expand(dist[..., :1].shape)
-    print(a.shape)
-    print(b.shape)
+    print(tc.linspace(0.0, 1.0, 64).shape)

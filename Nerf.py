@@ -1,10 +1,10 @@
 import numpy as np
-from torch import nn, relu
+from torch import nn
 import torch as tc
 
 import json
 import os
-import imageio.v2 as imageio
+import cv2
 
 
 dvc = tc.device("cuda" if tc.cuda.is_available() else "cpu")
@@ -14,7 +14,7 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # sampling
 n_coarse_samples = 6
-n_fine_samples = None
+n_fine_samples = 5
 near = 2
 far = 6
 
@@ -46,7 +46,7 @@ f_hyperparameter = {
 
 # train
 n_iter = 10000
-chunk_size = None
+chunk_size = 2**4
 
 # END CONFIG
 
@@ -116,12 +116,57 @@ def sample_stratified(rays_o, rays_d, near, far, n_samples):
     """
     t_vals = tc.linspace(0.0, 1.0, n_samples, device=dvc)
     z_vals = near * (1 - t_vals) + far * t_vals  # n_samples
-    z_vals = z_vals.expand(list(rays_d.shape[:-1]) + [n_samples])  # [W, H, n_samples]
+    z_vals = z_vals.expand(*rays_d.shape[:-1], n_samples)  # [W, H, n_samples]
     pts = (
         rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., None]
     )  # [W, H, N_samples, 3]
-    print(pts.shape)
     return pts, z_vals
+
+
+def sample_herarchical(z_vals, weights, n_h_sample, rays_o, rays_d):
+    z_vals_mid = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])  # (W, H, n_sample - 1)
+
+    pdf = (weights + 1e-5) / tc.sum(
+        weights + 1e-5, dim=-1, keepdim=True
+    )  # (W, H, n_sample)
+    cdf = tc.cumsum(pdf, dim=-1)
+    cdf = tc.cat((tc.ones_like(cdf[..., :1]), cdf), dim=-1)  # (W, H, n_sample + 1)
+
+    u = tc.linspace(0.0, 1.0, steps=n_h_sample, device=dvc)
+    u = u.expand(*cdf.shape[:-1], u.shape[-1])  # (W, H, n_h_sample)
+    u = u.contiguous()
+    # to find inverse cdf in the new sample.
+    inds = tc.searchsorted(cdf, u, right=True)  # (W, H, n_h_sample)
+
+    below = tc.clamp(inds - 1, min=0)
+    above = tc.clamp(inds, max=cdf.shape[-1] - 1)
+    # create bins.
+    inds_g = tc.stack(
+        [below, above], dim=-1
+    )  # (W, H, n_h_sample, 2) = (800, 800, 10, 2)
+
+    matched_shape = (
+        *inds_g.shape[:-1],
+        cdf.shape[-1],
+    )  # (W, H, n_h_sample, n_sample + 1) =  (800, 800, 10, 7)
+    # (800, 800, 10, 2)
+    cdf_g = tc.gather(
+        cdf.unsqueeze(-2).expand(matched_shape), dim=-1, index=inds_g
+    )  # replace index by value of the cdf, ranging [0, 1].
+    bins_g = tc.gather(
+        z_vals_mid.unsqueeze(-2).expand(matched_shape), dim=-1, index=inds_g
+    )
+
+    denom = cdf_g[..., 1] - cdf_g[..., 0]
+    denom = tc.where(denom < 1e-5, tc.ones_like(denom), denom)
+    t = (u - cdf_g[..., 0]) / denom
+    new_z_samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
+
+    new_z_samples = new_z_samples.detach()
+    z_vals_combined, _ = tc.sort(tc.cat([z_vals, new_z_samples], dim=-1), dim=-1)
+    # (W, H, n_samples + n_h_samples, 3)
+    pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals_combined[..., :, None]
+    return pts, z_vals_combined, new_z_samples
 
 
 def positional_encoding(pts, L):
@@ -153,7 +198,7 @@ def prepare_chunks(input, chunks_size):
     """Split to chunks
     Parameters
     __________
-    input : Tensor, expecting shape (W, H, n_sample, n_feature)
+    input : Tensor, expecting shape (W * H * n_sample, n_feature)
 
 
     Returns
@@ -161,7 +206,11 @@ def prepare_chunks(input, chunks_size):
 
     list: list of chunks.
     """
-    return [input[i : i + chunks_size] for i in (0, input.shape[0], chunks_size)]
+    # res = [input[i : i + chunks_size] for i in (0, input.shape[0], chunks_size)]
+    res = []
+    for i in range(0, input.shape[0], chunks_size):
+        res.append(input[i : i + chunks_size])
+    return res
 
 
 def cumprod_exclusive(tensor):
@@ -173,7 +222,7 @@ def cumprod_exclusive(tensor):
 
 def toRGB(raw, z_vals, rays_d):
     """From rgb, voxel of samples to rgb of rays."""
-    dist = z_vals[1:] - z_vals[:-1]
+    dist = z_vals[..., 1:] - z_vals[..., :-1]
     temp_t = tc.tensor([1e10], dtype=dist.dtype, device=dvc)  # W, H, n_sample
     dist = tc.cat((dist, temp_t.expand(*dist.shape[:-1], 1)), dim=-1)
 
@@ -291,7 +340,8 @@ class BlenderDataset:
         poses = []
         for frame in meta["frames"]:
             fn = os.path.join(self.basedir, frame["file_path"] + ".png")
-            img = imageio.imread(fn)
+            img = cv2.imread(fn)
+            img = cv2.resize(img, (100, 100))
             imgs.append(img)
             poses.append(np.array(frame["transform_matrix"]))
             # DEBUG:  purpose
@@ -301,9 +351,9 @@ class BlenderDataset:
         self.poses = tc.from_numpy(np.array(poses).astype(np.float32))
         self.imgs = (np.array(imgs) / 255.0).astype(np.float32)
         # white background
-        self.imgs = (255.0 * (1 - self.imgs[..., -1:])) + (
-            self.imgs[..., :-1] * self.imgs[..., -1:]
-        )
+        # self.imgs = (255.0 * (1 - self.imgs[..., -1:])) + (
+        #     self.imgs[..., :-1] * self.imgs[..., -1:]
+        # )
         self.imgs = tc.from_numpy(self.imgs)
         self.H, self.W = imgs[0].shape[:2]
         camera_angle_x = float(meta["camera_angle_x"])
@@ -317,7 +367,7 @@ class BlenderDataset:
         # temp_img = self.imgs[idx].to(device=dvc)
         # if dvc == "cuda" and not temp_img.is_cuda:
         #     raise Exception("Non cuda set")
-        return self.imgs[idx], self.poses[idx]
+        return self.imgs[idx], self.poses[idx].to(device=dvc)
 
 
 def NERF_forward(pose, focal, H, W, coarse_model, fine_model):
@@ -333,12 +383,14 @@ def NERF_forward(pose, focal, H, W, coarse_model, fine_model):
     pts = pts.view(-1, pts.shape[-1])
     pts = positional_encoding(pts, L_pts)  # (W * H * n_sample, -1)
 
-    viewdir = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)  # (W, H, 3)
-    viewdir = positional_encoding(viewdir, L_viewdir)  # (W, H, ?)
-    viewdir = viewdir[..., None, :].expand(
-        *viewdir.shape[:-1], n_coarse_samples, viewdir.shape[-1]
+    temp_viewdir = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)  # (W, H, 3)
+    temp_viewdir = positional_encoding(temp_viewdir, L_viewdir)  # (W, H, ?)
+    temp_viewdir = temp_viewdir[..., None, :]
+
+    viewdir = temp_viewdir.expand(
+        *temp_viewdir.shape[:-2], n_coarse_samples, temp_viewdir.shape[-1]
     )  # (W, H, n_sample, ?)
-    viewdir = viewdir.view(-1, viewdir.shape[-1])  # (W * H * n_samples, -1)
+    viewdir = viewdir.reshape(-1, viewdir.shape[-1])  # (W * H * n_samples, -1)
 
     # NOTE: Should I encode the whole, or only a needed chunk. That is the whole .
     chunk_pts = prepare_chunks(pts, chunk_size)
@@ -349,7 +401,45 @@ def NERF_forward(pose, focal, H, W, coarse_model, fine_model):
         predictions.append(coarse_model(xs, viewdirs))
     raw = tc.cat(predictions, dim=0)  # (-1, 4)
     raw = raw.view(W, H, -1, raw.shape[-1])
-    predticted_rgb, weights = toRGB(raw, z_vals, rays_d)  # (W, H, 3), (W, H, n_sample)
+    rgb_coarse, weights = toRGB(raw, z_vals, rays_d)  # (W, H, 3), (W, H, n_sample)
+
+    # fine model.
+    pts, z_vals_combined, new_z_vals = sample_herarchical(
+        z_vals, weights[..., 1:-1], n_fine_samples, rays_o, rays_d
+    )
+
+    pts = pts.view(-1, pts.shape[-1])
+    pts = positional_encoding(pts, L_pts)
+
+    viewdir1 = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)
+    viewdir1 = positional_encoding(viewdir1, L_viewdir)
+    viewdir1 = viewdir1[..., None, :].expand(
+        *viewdir1.shape[:-1], n_fine_samples + n_coarse_samples, viewdir1.shape[-1]
+    )
+    viewdir1 = viewdir.reshape(-1, viewdir1.shape[-1])
+
+    viewdir2 = temp_viewdir.expand(
+        *temp_viewdir.shape[:-2],
+        n_coarse_samples + n_fine_samples,
+        temp_viewdir.shape[-1],
+    )
+    viewdir2 = viewdir2.reshape(-1, viewdir2.shape[-1])
+
+    # print((viewdir2 == viewdir1).all())
+
+    viewdir = viewdir1
+
+    chunk_pts = prepare_chunks(pts, chunk_size)
+    chunk_viewdir = prepare_chunks(viewdir, chunk_size)
+
+    predictions = []
+    for xs, viewdirs in zip(chunk_pts, chunk_viewdir):
+        predictions.append(fine_model(xs, viewdirs))
+    raw = tc.cat(predictions, dim=0)
+    raw = raw.view(W, H, -1, raw.shape[-1])
+    rgb_fine, weights = toRGB(raw, z_vals_combined, rays_d)
+
+    return rgb_coarse, rgb_fine
 
     return
 
@@ -370,18 +460,9 @@ def train():
 
 
 if __name__ == "__main__":
-    # data = BlenderDataset()
-    # imgs, rays_o, rays_d = data[0]
-    # pts, z_vals = sample_stratified(rays_o, rays_d, near=2, far=6, n_samples=10)
-    # pts = pts.view(-1, 3)
-    # print(pts[0])
-    # print("_______________")
-    # encoding_pts = positional_encoding(pts, 3)
-    # print(encoding_pts[0])
-    # print(pts.shape)
-    # print(encoding_pts.shape)
-
-    a = tc.rand(4, 4, 3)
-    a = positional_encoding(a, 2)
-    print(a.shape)
-    print(a)
+    data = BlenderDataset()
+    img, pose = data[0]
+    pose = pose.to(device=dvc)
+    coarse = NERF(c_hyperparameter).to(device=dvc)
+    fine = NERF(f_hyperparameter).to(device=dvc)
+    NERF_forward(pose, data.focal, data.H, data.W, coarse, fine)
