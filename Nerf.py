@@ -6,6 +6,8 @@ import json
 import os
 import cv2
 
+import matplotlib.pyplot as plt
+
 
 dvc = tc.device("cuda" if tc.cuda.is_available() else "cpu")
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,7 +49,12 @@ f_hyperparameter = {
 # train
 n_iter = 10000
 chunk_size = 2**4
+lr = 5e-4
+dis_rate = 25
 
+
+# Blender data
+scale_ratio = 4
 # END CONFIG
 
 
@@ -83,14 +90,15 @@ def get_rays(pose, H, W, focal):
         ],
         dim=-1,
     )
-    # direction shape (W, H, 3)
+    # direction shape (H, H, 3)
     rays_d = tc.sum(pose[:3, :3] * direction[..., None, :], dim=-1)
+    rays_d = tc.transpose(rays_d, dim0=0, dim1=1)
     rays_o = pose[:-1, -1].expand(rays_d.shape)  # NOTE : redundant.
 
-    # TEST: test cuda.
-    check = rays_o.is_cuda and rays_d.is_cuda
-    if dvc == "cuda" and not check:
-        raise Exception("Non-cuda set")
+    # # TEST: test cuda.
+    # check = rays_o.is_cuda and rays_d.is_cuda
+    # if dvc == "cuda" and not check:
+    #     raise Exception("Non-cuda set")
 
     return rays_o, rays_d
 
@@ -116,10 +124,10 @@ def sample_stratified(rays_o, rays_d, near, far, n_samples):
     """
     t_vals = tc.linspace(0.0, 1.0, n_samples, device=dvc)
     z_vals = near * (1 - t_vals) + far * t_vals  # n_samples
-    z_vals = z_vals.expand(*rays_d.shape[:-1], n_samples)  # [W, H, n_samples]
+    z_vals = z_vals.expand(*rays_d.shape[:-1], n_samples)  # [H, W, n_samples]
     pts = (
         rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., None]
-    )  # [W, H, N_samples, 3]
+    )  # [H, W, N_samples, 3]
     return pts, z_vals
 
 
@@ -223,15 +231,15 @@ def cumprod_exclusive(tensor):
 def toRGB(raw, z_vals, rays_d):
     """From rgb, voxel of samples to rgb of rays."""
     dist = z_vals[..., 1:] - z_vals[..., :-1]
-    temp_t = tc.tensor([1e10], dtype=dist.dtype, device=dvc)  # W, H, n_sample
+    temp_t = tc.tensor([1e10], dtype=dist.dtype, device=dvc)  # H, W, n_sample
     dist = tc.cat((dist, temp_t.expand(*dist.shape[:-1], 1)), dim=-1)
 
-    dist = dist * tc.norm(rays_d, dim=-1, keepdim=True)  # (W, H, n_sample) * (W, H, 1)
-    # raw (W, H, n_sample, 4)
-    alpha = 1.0 - tc.exp(-nn.functional.relu(raw[..., 3]) * dist)  # (W, H, n_sample)
-    weights = alpha * cumprod_exclusive(1.0 - alpha + 1e-10)  # (W, H, n_sample)
+    dist = dist * tc.norm(rays_d, dim=-1, keepdim=True)  # (H, W n_sample) * (H, W, 1)
+    # raw (H, W, n_sample, 4)
+    alpha = 1.0 - tc.exp(-nn.functional.relu(raw[..., 3]) * dist)  # (H, W, n_sample)
+    weights = alpha * cumprod_exclusive(1.0 - alpha + 1e-10)  # (H, W, n_sample)
 
-    rgb = tc.sigmoid(raw[..., :3])  # (W, H, n_sample, 3)
+    rgb = tc.sigmoid(raw[..., :3])  # (H, W, n_sample, 3)
     rgb_map = tc.sum(weights[..., None] * rgb, dim=-2)
     acc_map = 1 - tc.sum(weights, -1, keepdim=True)
 
@@ -341,7 +349,7 @@ class BlenderDataset:
         for frame in meta["frames"]:
             fn = os.path.join(self.basedir, frame["file_path"] + ".png")
             img = cv2.imread(fn)
-            img = cv2.resize(img, (100, 100))
+            img = cv2.resize(img, (int(800 / scale_ratio), int(800 / scale_ratio)))
             imgs.append(img)
             poses.append(np.array(frame["transform_matrix"]))
             # DEBUG:  purpose
@@ -358,6 +366,7 @@ class BlenderDataset:
         self.H, self.W = imgs[0].shape[:2]
         camera_angle_x = float(meta["camera_angle_x"])
         self.focal = 0.5 * self.W / np.tan(0.5 * camera_angle_x)
+        self.focal = self.focal / scale_ratio
 
     def __len__(self):
         return self.imgs.shape[0]
@@ -376,15 +385,15 @@ def NERF_forward(pose, focal, H, W, coarse_model, fine_model):
     _______
     rgb_map : Tensor, expecting shape (H, W, 3), prediction image.
     """
-    rays_o, rays_d = get_rays(pose, H, W, focal)  # (W, H, 3)
+    rays_o, rays_d = get_rays(pose, H, W, focal)  # (H, W, 3)
     pts, z_vals = sample_stratified(rays_o, rays_d, near, far, n_coarse_samples)
-    # pts (W, H, n_sample, 3) , z_vals (W, H, n_sample)
+    # pts (H, W, n_sample, 3) , z_vals (H, W, n_sample)
 
     pts = pts.view(-1, pts.shape[-1])
     pts = positional_encoding(pts, L_pts)  # (W * H * n_sample, -1)
 
-    temp_viewdir = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)  # (W, H, 3)
-    temp_viewdir = positional_encoding(temp_viewdir, L_viewdir)  # (W, H, ?)
+    temp_viewdir = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)  # (H, W, 3)
+    temp_viewdir = positional_encoding(temp_viewdir, L_viewdir)  # (H, W, ?)
     temp_viewdir = temp_viewdir[..., None, :]
 
     viewdir = temp_viewdir.expand(
@@ -411,23 +420,19 @@ def NERF_forward(pose, focal, H, W, coarse_model, fine_model):
     pts = pts.view(-1, pts.shape[-1])
     pts = positional_encoding(pts, L_pts)
 
-    viewdir1 = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)
-    viewdir1 = positional_encoding(viewdir1, L_viewdir)
-    viewdir1 = viewdir1[..., None, :].expand(
-        *viewdir1.shape[:-1], n_fine_samples + n_coarse_samples, viewdir1.shape[-1]
-    )
-    viewdir1 = viewdir.reshape(-1, viewdir1.shape[-1])
+    # viewdir1 = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)
+    # viewdir1 = positional_encoding(viewdir1, L_viewdir)
+    # viewdir1 = viewdir1[..., None, :].expand(
+    #     *viewdir1.shape[:-1], n_fine_samples + n_coarse_samples, viewdir1.shape[-1]
+    # )
+    # viewdir1 = viewdir1.reshape(-1, viewdir1.shape[-1])
 
-    viewdir2 = temp_viewdir.expand(
+    viewdir = temp_viewdir.expand(
         *temp_viewdir.shape[:-2],
         n_coarse_samples + n_fine_samples,
         temp_viewdir.shape[-1],
     )
-    viewdir2 = viewdir2.reshape(-1, viewdir2.shape[-1])
-
-    # print((viewdir2 == viewdir1).all())
-
-    viewdir = viewdir1
+    viewdir = viewdir.reshape(-1, viewdir.shape[-1])
 
     chunk_pts = prepare_chunks(pts, chunk_size)
     chunk_viewdir = prepare_chunks(viewdir, chunk_size)
@@ -449,20 +454,51 @@ def train():
     dataset = BlenderDataset()
 
     # model
-    coarse_model = NERF(c_hyperparameter)
-    fine_model = NERF(f_hyperparameter)
+    coarse_model = NERF(c_hyperparameter).to(device=dvc)
+    fine_model = NERF(f_hyperparameter).to(device=dvc)
+
+    optimizer = tc.optim.Adam(
+        list(coarse_model.parameters()) + list(fine_model.parameters()), lr=lr
+    )
 
     # run train.
+    coarse_model.train()
+    fine_model.train()
+
+    train_psnr = []
     for _ in range(n_iter):
         img_idx = np.random.randint(len(dataset))
-        gt_rgb, pose = dataset[img_idx]
-        NERF_forward(pose, dataset.focal)
+        rgb_gt, pose = dataset[img_idx]
+        rgb_coarse, rgb_fine = NERF_forward(
+            pose, dataset.focal, dataset.H, dataset.W, coarse_model, fine_model
+        )
+
+        # Check for any numerical issues.
+        for i, v in enumerate([rgb_coarse, rgb_fine]):
+            if tc.isnan(v).any():
+                print(f"! [Numerical Alert] {i} contains NaN.")
+            if tc.isinf(v).any():
+                print(f"! [Numerical Alert] {i} contains Inf.")
+
+        # TEST
+        print("check, delete")
+        print(rgb_gt.shape)
+        print(rgb_coarse.shape)
+        print(rgb_fine.shape)
+        loss = tc.nn.functional.mse_loss(rgb_coarse, rgb_gt)
+        loss = loss + tc.nn.functional.mse_loss(rgb_fine, rgb_gt)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        psnr = -10 * tc.log10(loss)
+
+        train_psnr.append(psnr.item())
+        print(f"PSNR: {psnr}")
+
+        if _ % dis_rate == 0:
+            plt.imshow(rgb_fine.detach().cpu().numpy())
+            plt.show()
 
 
 if __name__ == "__main__":
-    data = BlenderDataset()
-    img, pose = data[0]
-    pose = pose.to(device=dvc)
-    coarse = NERF(c_hyperparameter).to(device=dvc)
-    fine = NERF(f_hyperparameter).to(device=dvc)
-    NERF_forward(pose, data.focal, data.H, data.W, coarse, fine)
+    train()
