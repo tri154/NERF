@@ -6,7 +6,8 @@ import json
 import os
 import cv2
 
-import matplotlib.pyplot as plt
+from tqdm import trange
+from google.colab.patches import cv2_imshow
 
 
 dvc = tc.device("cuda" if tc.cuda.is_available() else "cpu")
@@ -15,8 +16,8 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # CONFIG
 
 # sampling
-n_coarse_samples = 6
-n_fine_samples = 5
+n_coarse_samples = 64
+n_fine_samples = 64
 near = 2
 far = 6
 
@@ -45,17 +46,32 @@ f_hyperparameter = {
     "d_u_filter": 128,
     "d_u_input": 3 * (1 + 2 * L_viewdir),
 }
-
 # train
 n_iter = 10000
-chunk_size = 2**4
+chunk_size = 2**10
 lr = 5e-4
-dis_rate = 25
+dis_rate = 10
 
 
 # Blender data
-scale_ratio = 4
+scale_ratio = 8
 # END CONFIG
+
+
+def load_model(coarse_model, fine_model):
+    coarse_model.load_state_dict(
+        tc.load(os.path.join(ROOT_DIR, "coarse_model.pt"), weights_only=True)
+    )
+    coarse_model.to(device=dvc)
+    fine_model.load_state_dict(
+        tc.load(os.path.join(ROOT_DIR, "fine_model.pt"), weights_only=True)
+    )
+    fine_model.to(device=dvc)
+
+
+def save_model(coarse_model, fine_model):
+    tc.save(coarse_model.state_dict(), os.path.join(ROOT_DIR, "coarse_model.pt"))
+    tc.save(fine_model.state_dict(), os.path.join(ROOT_DIR, "fine_model.pt"))
 
 
 def get_rays(pose, H, W, focal):
@@ -94,11 +110,6 @@ def get_rays(pose, H, W, focal):
     rays_d = tc.sum(pose[:3, :3] * direction[..., None, :], dim=-1)
     rays_d = tc.transpose(rays_d, dim0=0, dim1=1)
     rays_o = pose[:-1, -1].expand(rays_d.shape)  # NOTE : redundant.
-
-    # # TEST: test cuda.
-    # check = rays_o.is_cuda and rays_d.is_cuda
-    # if dvc == "cuda" and not check:
-    #     raise Exception("Non-cuda set")
 
     return rays_o, rays_d
 
@@ -353,7 +364,7 @@ class BlenderDataset:
             imgs.append(img)
             poses.append(np.array(frame["transform_matrix"]))
             # DEBUG:  purpose
-            break
+            # break
             # DEBUG: purpose
 
         self.poses = tc.from_numpy(np.array(poses).astype(np.float32))
@@ -389,7 +400,7 @@ def NERF_forward(pose, focal, H, W, coarse_model, fine_model):
     pts, z_vals = sample_stratified(rays_o, rays_d, near, far, n_coarse_samples)
     # pts (H, W, n_sample, 3) , z_vals (H, W, n_sample)
 
-    pts = pts.view(-1, pts.shape[-1])
+    pts = pts.reshape(-1, pts.shape[-1])
     pts = positional_encoding(pts, L_pts)  # (W * H * n_sample, -1)
 
     temp_viewdir = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)  # (H, W, 3)
@@ -417,7 +428,7 @@ def NERF_forward(pose, focal, H, W, coarse_model, fine_model):
         z_vals, weights[..., 1:-1], n_fine_samples, rays_o, rays_d
     )
 
-    pts = pts.view(-1, pts.shape[-1])
+    pts = pts.reshape(-1, pts.shape[-1])
     pts = positional_encoding(pts, L_pts)
 
     # viewdir1 = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)
@@ -449,18 +460,7 @@ def NERF_forward(pose, focal, H, W, coarse_model, fine_model):
     return
 
 
-def train():
-    # data
-    dataset = BlenderDataset()
-
-    # model
-    coarse_model = NERF(c_hyperparameter).to(device=dvc)
-    fine_model = NERF(f_hyperparameter).to(device=dvc)
-
-    optimizer = tc.optim.Adam(
-        list(coarse_model.parameters()) + list(fine_model.parameters()), lr=lr
-    )
-
+def train(dataset, coarse_model, fine_model, optimizer):
     # run train.
     coarse_model.train()
     fine_model.train()
@@ -469,6 +469,7 @@ def train():
     for _ in range(n_iter):
         img_idx = np.random.randint(len(dataset))
         rgb_gt, pose = dataset[img_idx]
+        rgb_gt = rgb_gt.to(device=dvc)
         rgb_coarse, rgb_fine = NERF_forward(
             pose, dataset.focal, dataset.H, dataset.W, coarse_model, fine_model
         )
@@ -480,11 +481,6 @@ def train():
             if tc.isinf(v).any():
                 print(f"! [Numerical Alert] {i} contains Inf.")
 
-        # TEST
-        print("check, delete")
-        print(rgb_gt.shape)
-        print(rgb_coarse.shape)
-        print(rgb_fine.shape)
         loss = tc.nn.functional.mse_loss(rgb_coarse, rgb_gt)
         loss = loss + tc.nn.functional.mse_loss(rgb_fine, rgb_gt)
         loss.backward()
@@ -496,9 +492,20 @@ def train():
         print(f"PSNR: {psnr}")
 
         if _ % dis_rate == 0:
-            plt.imshow(rgb_fine.detach().cpu().numpy())
+            # add collab cv imshow
+            plt.imshow(rgb_fine.detach().cpu().numpy() * 255)
             plt.show()
 
 
 if __name__ == "__main__":
-    train()
+    # data
+    dataset = BlenderDataset()
+
+    # model
+    coarse_model = NERF(c_hyperparameter).to(device=dvc)
+    fine_model = NERF(f_hyperparameter).to(device=dvc)
+
+    optimizer = tc.optim.Adam(
+        list(coarse_model.parameters()) + list(fine_model.parameters()), lr=lr
+    )
+    train(dataset, coarse_model, fine_model, optimizer)
