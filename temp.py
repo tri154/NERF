@@ -18,7 +18,4 @@ class Test:
 
 
 if __name__ == "__main__":
-    t = tc.rand(12, 13, 14)
-    print(t.shape)
-    a = tc.transpose(t, 0, 1)
-    print(a.shape)
+    print(1e-4)

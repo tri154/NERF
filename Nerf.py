@@ -457,8 +457,6 @@ def NERF_forward(pose, focal, H, W, coarse_model, fine_model):
 
     return rgb_coarse, rgb_fine
 
-    return
-
 
 def train(dataset, coarse_model, fine_model, optimizer):
     # run train.

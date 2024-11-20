@@ -60,21 +60,23 @@ config_color_mlp = """{
 
 
 # sampling
-n_coarse_samples = 64
-n_fine_samples = 64
+n_samples = 64
 near = 2
 far = 6
 
 
 # train
 n_iter = 10000
-chunk_size = 2**10
-lr = 5e-4
-dis_rate = 10
+chunk_size = 2**18
+lr = 1e-4
+beta1 = 0.9
+beta2 = 0.99
+eps = 1e-15
+dis_rate = 25
 
 
 # Blender data
-scale_ratio = 8
+scale_ratio = 1
 # END CONFIG
 
 
@@ -126,7 +128,7 @@ def get_rays(pose, H, W, focal):
         ],
         dim=-1,
     )
-    # direction shape (H, H, 3)
+    # direction shape (H, W, 3)
     rays_d = tc.sum(pose[:3, :3] * direction[..., None, :], dim=-1)
     rays_d = tc.transpose(rays_d, dim0=0, dim1=1)
     rays_o = pose[:-1, -1].expand(rays_d.shape)  # NOTE : redundant.
@@ -220,7 +222,6 @@ def prepare_chunks(input, chunks_size):
 
     list: list of chunks.
     """
-    # res = [input[i : i + chunks_size] for i in (0, input.shape[0], chunks_size)]
     res = []
     for i in range(0, input.shape[0], chunks_size):
         res.append(input[i : i + chunks_size])
@@ -251,7 +252,7 @@ def toRGB(raw, z_vals, rays_d):
 
     # for white backgroundo
     rgb_map = rgb_map + acc_map
-    return rgb_map, weights
+    return rgb_map
 
 
 class BlenderDataset:
@@ -307,10 +308,6 @@ class BlenderDataset:
         return self.imgs.shape[0]
 
     def __getitem__(self, idx):
-        # # TEST: test cuda.
-        # temp_img = self.imgs[idx].to(device=dvc)
-        # if dvc == "cuda" and not temp_img.is_cuda:
-        #     raise Exception("Non cuda set")
         return self.imgs[idx], self.poses[idx].to(device=dvc)
 
 
@@ -321,7 +318,7 @@ def init_model():
         3, 16, cfg_density_mlp["encoding"], cfg_density_mlp["network"]
     ).to(device=dvc)
     viewdir_encoder = tcnn.Encoding(3, cfg_color_mlp["dir_encoding"]).to(device=dvc)
-    color_mlp = tcnn.Network(32, 3, cfg_color_mlp["network"])
+    color_mlp = tcnn.Network(32, 3, cfg_color_mlp["network"]).to(device=dvc)
     return density_mlp, viewdir_encoder, color_mlp
 
 
@@ -336,102 +333,63 @@ class HashNeRF(nn.Module):
         viewdir = self.e2(viewdir)  # (batch_size,..., 16)
         viewdir = tc.cat((viewdir, x), dim=-1)
         viewdir = self.e2(viewdir)  # (batch_size,..., 3)
-        return viewdir, log_space_density
+        return tc.cat((viewdir, tc.exp(log_space_density)), dim=-1)
+
+    def params(self):
+        return list(self.ne1.parameters(), self.n2.prarameters(), self.e2.parameters())
 
 
-def NERF_forward(pose, focal, H, W, coarse_model, fine_model):
+def NERF_forward(pose, focal, H, W, model):
     """Run a forward of the model with input as an image.
     Returns
     _______
     rgb_map : Tensor, expecting shape (H, W, 3), prediction image.
     """
     rays_o, rays_d = get_rays(pose, H, W, focal)  # (H, W, 3)
-    pts, z_vals = sample_stratified(rays_o, rays_d, near, far, n_coarse_samples)
+    pts, z_vals = sample_stratified(rays_o, rays_d, near, far, n_samples)
     # pts (H, W, n_sample, 3) , z_vals (H, W, n_sample)
-
     pts = pts.reshape(-1, pts.shape[-1])
-    pts = positional_encoding(pts, L_pts)  # (W * H * n_sample, -1)
 
-    temp_viewdir = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)  # (H, W, 3)
-    temp_viewdir = positional_encoding(temp_viewdir, L_viewdir)  # (H, W, ?)
-    temp_viewdir = temp_viewdir[..., None, :]
-
-    viewdir = temp_viewdir.expand(
-        *temp_viewdir.shape[:-2], n_coarse_samples, temp_viewdir.shape[-1]
+    viewdir = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)  # (H, W, 3)
+    viewdir = viewdir[..., None, :]
+    viewdir = viewdir.expand(
+        *viewdir.shape[:-2], n_samples, viewdir.shape[-1]
     )  # (W, H, n_sample, ?)
     viewdir = viewdir.reshape(-1, viewdir.shape[-1])  # (W * H * n_samples, -1)
 
-    # NOTE: Should I encode the whole, or only a needed chunk. That is the whole .
+    # NOTE: Should I encode the whole, or only a needed chunk. That is only the batch .
     chunk_pts = prepare_chunks(pts, chunk_size)
     chunk_viewdir = prepare_chunks(viewdir, chunk_size)
 
     predictions = []
     for xs, viewdirs in zip(chunk_pts, chunk_viewdir):
-        predictions.append(coarse_model(xs, viewdirs))
+        predictions.append(model(xs, viewdirs))
     raw = tc.cat(predictions, dim=0)  # (-1, 4)
-    raw = raw.view(W, H, -1, raw.shape[-1])
-    rgb_coarse, weights = toRGB(raw, z_vals, rays_d)  # (W, H, 3), (W, H, n_sample)
+    raw = raw.view(H, W, -1, raw.shape[-1])
+    rgb_predition = toRGB(raw, z_vals, rays_d)  # (W, H, 3), (W, H, n_sample)
 
-    # fine model.
-    pts, z_vals_combined, new_z_vals = sample_herarchical(
-        z_vals, weights[..., 1:-1], n_fine_samples, rays_o, rays_d
-    )
-
-    pts = pts.reshape(-1, pts.shape[-1])
-    pts = positional_encoding(pts, L_pts)
-
-    # viewdir1 = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)
-    # viewdir1 = positional_encoding(viewdir1, L_viewdir)
-    # viewdir1 = viewdir1[..., None, :].expand(
-    #     *viewdir1.shape[:-1], n_fine_samples + n_coarse_samples, viewdir1.shape[-1]
-    # )
-    # viewdir1 = viewdir1.reshape(-1, viewdir1.shape[-1])
-
-    viewdir = temp_viewdir.expand(
-        *temp_viewdir.shape[:-2],
-        n_coarse_samples + n_fine_samples,
-        temp_viewdir.shape[-1],
-    )
-    viewdir = viewdir.reshape(-1, viewdir.shape[-1])
-
-    chunk_pts = prepare_chunks(pts, chunk_size)
-    chunk_viewdir = prepare_chunks(viewdir, chunk_size)
-
-    predictions = []
-    for xs, viewdirs in zip(chunk_pts, chunk_viewdir):
-        predictions.append(fine_model(xs, viewdirs))
-    raw = tc.cat(predictions, dim=0)
-    raw = raw.view(W, H, -1, raw.shape[-1])
-    rgb_fine, weights = toRGB(raw, z_vals_combined, rays_d)
-
-    return rgb_coarse, rgb_fine
-
-    return
+    return rgb_predition
 
 
-def train(dataset, coarse_model, fine_model, optimizer):
+def train(dataset, model, optimizer):
     # run train.
-    coarse_model.train()
-    fine_model.train()
+    model.train()
 
     train_psnr = []
     for _ in range(n_iter):
         img_idx = np.random.randint(len(dataset))
         rgb_gt, pose = dataset[img_idx]
         rgb_gt = rgb_gt.to(device=dvc)
-        rgb_coarse, rgb_fine = NERF_forward(
-            pose, dataset.focal, dataset.H, dataset.W, coarse_model, fine_model
-        )
+        rgb_prediction = NERF_forward(pose, dataset.focal, dataset.H, dataset.W, model)
 
-        # Check for any numerical issues.
-        for i, v in enumerate([rgb_coarse, rgb_fine]):
-            if tc.isnan(v).any():
-                print(f"! [Numerical Alert] {i} contains NaN.")
-            if tc.isinf(v).any():
-                print(f"! [Numerical Alert] {i} contains Inf.")
+        # TEST: Check for any numerical issues.
+        if tc.isnan(rgb_prediction).any():
+            print("! [Numerical Alert] contains NaN.")
+        if tc.isinf(rgb_prediction).any():
+            print("! [Numerical Alert] contains Inf.")
 
-        loss = tc.nn.functional.mse_loss(rgb_coarse, rgb_gt)
-        loss = loss + tc.nn.functional.mse_loss(rgb_fine, rgb_gt)
+        loss = tc.nn.functional.mse_loss(rgb_prediction, rgb_gt)
+
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
@@ -442,9 +400,15 @@ def train(dataset, coarse_model, fine_model, optimizer):
 
         if _ % dis_rate == 0:
             # add collab cv imshow
-            plt.imshow(rgb_fine.detach().cpu().numpy() * 255)
-            plt.show()
+            cv2_imshow(rgb_prediction.detach().cpu().numpy() * 255)
 
 
 if __name__ == "__main__":
-    pass
+    # data
+    data = BlenderDataset()
+    # model
+    model = HashNeRF()
+    # optimizer
+    optimizer = tc.optim.Adam(model.params(), lr, (beta1, beta2), eps)
+
+    train(data, model, optimizer)
