@@ -285,7 +285,8 @@ class BlenderDataset:
         for frame in meta["frames"]:
             fn = os.path.join(self.basedir, frame["file_path"] + ".png")
             img = cv2.imread(fn)
-            img = cv2.resize(img, (int(800 / scale_ratio), int(800 / scale_ratio)))
+            if scale_ratio != 1:
+                img = cv2.resize(img, (int(800 / scale_ratio), int(800 / scale_ratio)))
             imgs.append(img)
             poses.append(np.array(frame["transform_matrix"]))
             # DEBUG:  purpose
