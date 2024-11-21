@@ -18,4 +18,5 @@ class Test:
 
 
 if __name__ == "__main__":
-    print(1e-4)
+    a = tc.as_tensor([1, 2, 3, 4])
+    print(a.shape)

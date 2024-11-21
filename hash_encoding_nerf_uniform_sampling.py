@@ -3,6 +3,7 @@ import tinycudann as tcnn
 import numpy as np
 from torch import nn
 import torch as tc
+import nerfacc
 
 import json
 import os
@@ -76,7 +77,7 @@ dis_rate = 25
 
 
 # Blender data
-scale_ratio = 1
+scale_ratio = 4
 # END CONFIG
 
 
@@ -316,11 +317,14 @@ def init_model():
     cfg_density_mlp = json.loads(config_density_mlp)
     cfg_color_mlp = json.loads(config_color_mlp)
     density_mlp = tcnn.NetworkWithInputEncoding(
-        3, 16, cfg_density_mlp["encoding"], cfg_density_mlp["network"]
+        3,
+        16,
+        endcoding_config=cfg_density_mlp["encoding"],
+        network_config=cfg_density_mlp["network"],
     ).to(device=dvc)
     viewdir_encoder = tcnn.Encoding(3, cfg_color_mlp["dir_encoding"]).to(device=dvc)
     color_mlp = tcnn.Network(32, 3, cfg_color_mlp["network"]).to(device=dvc)
-    return density_mlp, viewdir_encoder, color_mlp
+    return density_mlp, color_mlp, viewdir_encoder
 
 
 class HashNeRF(nn.Module):
@@ -333,11 +337,15 @@ class HashNeRF(nn.Module):
         log_space_density = x[..., :1]  # (batch_size,..., 1)
         viewdir = self.e2(viewdir)  # (batch_size,..., 16)
         viewdir = tc.cat((viewdir, x), dim=-1)
-        viewdir = self.e2(viewdir)  # (batch_size,..., 3)
+        viewdir = self.n2(viewdir)  # (batch_size,..., 3)
         return tc.cat((viewdir, tc.exp(log_space_density)), dim=-1)
 
     def params(self):
-        return list(self.ne1.parameters(), self.n2.prarameters(), self.e2.parameters())
+        return (
+            list(self.ne1.parameters())
+            + list(self.n2.parameters())
+            + list(self.e2.parameters())
+        )
 
 
 def NERF_forward(pose, focal, H, W, model):
@@ -347,6 +355,8 @@ def NERF_forward(pose, focal, H, W, model):
     rgb_map : Tensor, expecting shape (H, W, 3), prediction image.
     """
     rays_o, rays_d = get_rays(pose, H, W, focal)  # (H, W, 3)
+    rays_o = rays_o.reshape(-1, rays_o.shape[-1])
+    rays_d = rays_d.reshape(-1, rays_d.shape[-1])
     pts, z_vals = sample_stratified(rays_o, rays_d, near, far, n_samples)
     # pts (H, W, n_sample, 3) , z_vals (H, W, n_sample)
     pts = pts.reshape(-1, pts.shape[-1])
@@ -377,7 +387,7 @@ def train(dataset, model, optimizer):
     model.train()
 
     train_psnr = []
-    for _ in range(n_iter):
+    for _ in trange(n_iter):
         img_idx = np.random.randint(len(dataset))
         rgb_gt, pose = dataset[img_idx]
         rgb_gt = rgb_gt.to(device=dvc)
@@ -411,5 +421,10 @@ if __name__ == "__main__":
     model = HashNeRF()
     # optimizer
     optimizer = tc.optim.Adam(model.params(), lr, (beta1, beta2), eps)
+
+    radius = 1.5
+    roi_aabb = tc.ones(6) * radius
+    roi_aabb[:3] = roi_aabb[:3] * -1
+    nerfacc.OccGridEstimator(roi_aabb, 128, 1)
 
     train(data, model, optimizer)
