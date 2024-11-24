@@ -1,11 +1,9 @@
-from functools import update_wrapper
-from sys import exception
+#fail
 import tinycudann as tcnn
 
 import numpy as np
 from torch import nn
 import torch as tc
-import nerfacc
 
 import json
 import os
@@ -15,9 +13,10 @@ from tqdm import trange
 from google.colab.patches import cv2_imshow
 from torch.amp import custom_bwd, custom_fwd
 
+
 dvc = tc.device("cuda" if tc.cuda.is_available() else "cpu")
 
-ROOT_DIR = "/content/drive/Othercomputers/My Laptop/Subjects/2.Introduction to Cognitive Intelligence/project"
+ROOT_DIR = "/content/drive/MyDrive/NERF_data"
 
 # CONFIG
 # model
@@ -62,29 +61,6 @@ config_color_mlp = """{
 	}
 }"""
 
-
-# sampling
-n_samples = 1024
-radius = 1.5
-roi_aabb = tc.ones(6) * radius
-roi_aabb[:3] = roi_aabb[:3] * -1
-
-
-# train
-n_iter = 10000
-chunk_size = 2**18
-lr = 1e-4
-beta1 = 0.9
-beta2 = 0.99
-eps = 1e-15
-dis_rate = 25
-
-
-# Blender data
-scale_ratio = 4
-# END CONFIG
-
-
 class _trunc_exp(tc.autograd.Function):
     @staticmethod
     @custom_fwd(cast_inputs=tc.float32, device_type="cuda")
@@ -102,7 +78,27 @@ class _trunc_exp(tc.autograd.Function):
 trunc_exp = _trunc_exp.apply
 
 
-# TODO:  modify later
+# sampling
+n_samples = 64
+near = 2
+far = 6
+
+
+# train
+n_iter = 10000
+chunk_size = 2**18
+lr = 1e-4
+beta1 = 0.9
+beta2 = 0.99
+eps = 1e-15
+dis_rate = 25
+
+
+# Blender data
+scale_ratio = 4
+# END CONFIG
+
+
 def load_model(coarse_model, fine_model):
     coarse_model.load_state_dict(
         tc.load(os.path.join(ROOT_DIR, "coarse_model.pt"), weights_only=True)
@@ -152,9 +148,9 @@ def get_rays(pose, H, W, focal):
         dim=-1,
     )
     # direction shape (H, W, 3)
-    rays_d = tc.sum(pose[:3, :3] * direction[..., None, :], dim=-1)
-    rays_d = tc.transpose(rays_d, dim0=0, dim1=1)
-    rays_o = pose[:-1, -1].expand(rays_d.shape)  # NOTE : redundant.
+    rays_d = tc.sum(pose[..., :3, :3] * direction[None, ..., None, :], dim=-1)
+    rays_d = tc.transpose(rays_d, dim0=1, dim1=2)
+    rays_o = pose[...,:-1, -1].expand(rays_d.shape)  # NOTE : redundant.
 
     return rays_o, rays_d
 
@@ -185,6 +181,7 @@ def sample_stratified(rays_o, rays_d, near, far, n_samples):
         rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., None]
     )  # [H, W, N_samples, 3]
     return pts, z_vals
+
 
 
 def prepare_chunks(input, chunks_size):
@@ -220,10 +217,11 @@ def toRGB(raw, z_vals, rays_d):
 
     dist = dist * tc.norm(rays_d, dim=-1, keepdim=True)  # (H, W n_sample) * (H, W, 1)
     # raw (H, W, n_sample, 4)
-    alpha = 1.0 - tc.exp(-raw[..., 3] * dist)  # (H, W, n_sample)
+    alpha = 1.0 - tc.exp(-nn.functional.relu(raw[..., 3]) * dist)  # (H, W, n_sample)
+    # alpha = 1.0 - tc.exp(-raw[..., 3]) * dist  # (H, W, n_sample)
     weights = alpha * cumprod_exclusive(1.0 - alpha + 1e-10)  # (H, W, n_sample)
 
-    rgb = raw[..., :3]  # (H, W, n_sample, 3)
+    rgb = tc.sigmoid(raw[..., :3])  # (H, W, n_sample, 3)
     rgb_map = tc.sum(weights[..., None] * rgb, dim=-2)
     acc_map = 1 - tc.sum(weights, -1, keepdim=True)
 
@@ -267,16 +265,16 @@ class BlenderDataset:
             imgs.append(img)
             poses.append(np.array(frame["transform_matrix"]))
             # DEBUG:  purpose
-            # break
+            break
             # DEBUG: purpose
 
         self.poses = tc.from_numpy(np.array(poses).astype(np.float32))
+        self.poses = self.poses.to(device=dvc)
+
         self.imgs = (np.array(imgs) / 255.0).astype(np.float32)
-        # white background
-        # self.imgs = (255.0 * (1 - self.imgs[..., -1:])) + (
-        #     self.imgs[..., :-1] * self.imgs[..., -1:]
-        # )
         self.imgs = tc.from_numpy(self.imgs)
+        self.imgs = self.imgs.to(device=dvc)
+
         self.H, self.W = imgs[0].shape[:2]
         camera_angle_x = float(meta["camera_angle_x"])
         self.focal = 0.5 * self.W / np.tan(0.5 * camera_angle_x)
@@ -286,17 +284,14 @@ class BlenderDataset:
         return self.imgs.shape[0]
 
     def __getitem__(self, idx):
-        return self.imgs[idx], self.poses[idx].to(device=dvc)
+        return self.imgs[idx], self.poses[idx]
 
 
 def init_model():
     cfg_density_mlp = json.loads(config_density_mlp)
     cfg_color_mlp = json.loads(config_color_mlp)
     density_mlp = tcnn.NetworkWithInputEncoding(
-        3,
-        16,
-        encoding_config=cfg_density_mlp["encoding"],
-        network_config=cfg_density_mlp["network"],
+        3, 16, cfg_density_mlp["encoding"], cfg_density_mlp["network"]
     ).to(device=dvc)
     viewdir_encoder = tcnn.Encoding(3, cfg_color_mlp["dir_encoding"]).to(device=dvc)
     color_mlp = tcnn.Network(32, 3, cfg_color_mlp["network"]).to(device=dvc)
@@ -308,136 +303,70 @@ class HashNeRF(nn.Module):
         super().__init__()
         self.ne1, self.n2, self.e2 = init_model()
 
-    def geometry(self, x):
-        x = self.ne1(x)
-        log_space_density = x[..., :1]
-        return trunc_exp(log_space_density)
-
-    def texture(self, x, viewdir):
-        x = self.ne1(x)  # (batch_size, ..., 16)
-        log_space_density = x[..., :1]  # (batch_size,..., 1)
-        viewdir = self.e2(viewdir)  # (batch_size,..., 16)
-        viewdir = tc.cat((viewdir, x), dim=-1)
-        viewdir = self.n2(viewdir)  # (batch_size,..., 3)
-
-        # apply activation function.
-        viewdir = tc.sigmoid(viewdir)
-        log_space_density = trunc_exp(log_space_density)
-
-        return viewdir, log_space_density
-
     def forward(self, x, viewdir):
         x = self.ne1(x)  # (batch_size, ..., 16)
         log_space_density = x[..., :1]  # (batch_size,..., 1)
         viewdir = self.e2(viewdir)  # (batch_size,..., 16)
         viewdir = tc.cat((viewdir, x), dim=-1)
         viewdir = self.n2(viewdir)  # (batch_size,..., 3)
-
-        # apply activation function.
-        viewdir = tc.sigmoid(viewdir)
-        log_space_density = trunc_exp(log_space_density)
-
-        return tc.cat((viewdir, log_space_density), dim=-1)
+        return tc.cat((viewdir, trunc_exp(log_space_density)), dim=-1)
 
     def params(self):
-        return (
-            list(self.ne1.parameters())
-            + list(self.n2.parameters())
-            + list(self.e2.parameters())
-        )
+        return list(self.ne1.parameters()) + list(self.n2.parameters()) + list(self.e2.parameters())
 
 
-def NERF_forward(pose, focal, H, W, model, estimator):
+def NERF_forward(pose, focal, H, W, model):
     """Run a forward of the model with input as an image.
     Returns
     _______
     rgb_map : Tensor, expecting shape (H, W, 3), prediction image.
     """
     rays_o, rays_d = get_rays(pose, H, W, focal)  # (H, W, 3)
-    rays_o = rays_o.reshape(-1, rays_o.shape[-1])  # (H * W, 3)
-    rays_d = rays_d.reshape(-1, rays_d.shape[-1])  # (H * W, 3)
-    rays_d = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)
+    pts, z_vals = sample_stratified(rays_o, rays_d, near, far, n_samples)
+    # pts (H, W, n_sample, 3) , z_vals (H, W, n_sample)
+    pts = pts.reshape(-1, pts.shape[-1])
 
-    def sigma_fn(t_starts, t_ends, ray_indices):
-        # t_starts, t_ends (n_samples, 1)
-        ray_indices = ray_indices.long()
-        t_origins = rays_o[ray_indices]  # (n_sample, 3)
-        t_dirs = rays_d[ray_indices]  # (n_sample, 3)
-        # TEST:
-        if (t_starts + t_ends).ndims != 1:
-            raise Exception("dims error")
-        positions = (
-            t_origins + t_dirs * (t_starts + t_ends)[..., None] / 2.0
-        )  # (n_samples, 3)
-        density = model.geometry(positions)
-        return density  # (n_samples, 1)
+    viewdir = rays_d / tc.norm(rays_d, dim=-1, keepdim=True)  # (H, W, 3)
+    viewdir = viewdir[..., None, :]
+    viewdir = viewdir.expand(
+        *viewdir.shape[:-2], n_samples, viewdir.shape[-1]
+    )  # (W, H, n_sample, ?)
+    viewdir = viewdir.reshape(-1, viewdir.shape[-1])  # (W * H * n_samples, -1)
 
-    def rgb_sigma_fn(t_starts, t_ends, ray_indices):
-        ray_indices = ray_indices.long()
-        t_origins = rays_o[ray_indices]
-        t_dirs = rays_d[ray_indices]  # (n_samples, 3)
-        # TEST:
-        if (t_starts + t_ends).ndims != 1:
-            raise Exception("dims error")
-        positions = t_origins + t_dirs * (t_starts + t_ends)[..., None] / 2.0
-        rgb, density = model.texture(positions, t_dirs)
-        return rgb, density
+    # NOTE: Should I encode the whole, or only a needed chunk. That is only the batch .
+    chunk_pts = prepare_chunks(pts, chunk_size)
+    chunk_viewdir = prepare_chunks(viewdir, chunk_size)
 
-    with tc.no_grad():
-        ray_indices, t_starts, t_ends = estimator.sampling(
-            rays_o,
-            rays_d,
-            sigma_fn,
-            near_plane=0.2,
-            far_plane=1e4,
-            render_step_size=1.732 * 2 * radius / n_samples,
-            cone_angle=0.0,
-            early_stop_eps=1e-4,
-            alpha_thre=0.0,
-        )
-    # if overflow, it need to be seperated.
-    # chunk_pts = prepare_chunks(pts, chunk_size)
-    # chunk_viewdir = prepare_chunks(t_dirs, chunk_size)
+    predictions = []
+    for xs, viewdirs in zip(chunk_pts, chunk_viewdir):
+        predictions.append(model(xs, viewdirs))
+    raw = tc.cat(predictions, dim=0)  # (-1, 4)
+    raw = raw.view(H, W, -1, raw.shape[-1])
+    rgb_predition = toRGB(raw, z_vals, rays_d)  # (W, H, 3), (W, H, n_sample)
 
-    # NOTE: can be optimized.
-    colors, opacities, depths, extras = nerfacc.rendering(
-        t_starts, t_ends, ray_indices, n_rays=rays_o.shape[0], rgb_sigma_fn=rgb_sigma_fn
-    )
-    return colors, opacities, depths, extras
+    return rgb_predition
 
 
-def train(dataset, model, optimizer, estimator):
+def train(dataset, model, optimizer):
     # run train.
     model.train()
 
     train_psnr = []
-    step = 0
     for _ in trange(n_iter):
         img_idx = np.random.randint(len(dataset))
         rgb_gt, pose = dataset[img_idx]
-        rgb_gt = rgb_gt.to(device=dvc)
-        rgb_gt.view(-1, rgb_gt.shape[-1])
-        colors, opacities, depths, extras = NERF_forward(
-            pose, dataset.focal, dataset.H, dataset.W, model, estimator
-        )
+        rgb_prediction = NERF_forward(pose, dataset.focal, dataset.H, dataset.W, model)
 
         # TEST: Check for any numerical issues.
-        # if tc.isnan(rgb_prediction).any():
-        #     print("! [Numerical Alert] contains NaN.")
-        # if tc.isinf(rgb_prediction).any():
-        #     print("! [Numerical Alert] contains Inf.")
+        if tc.isnan(rgb_prediction).any():
+            print("! [Numerical Alert] contains NaN.")
+        if tc.isinf(rgb_prediction).any():
+            print("! [Numerical Alert] contains Inf.")
 
-        loss = tc.nn.functional.mse_loss(colors, rgb_gt)
+        loss = tc.nn.functional.mse_loss(rgb_prediction, rgb_gt)
 
         loss.backward()
         optimizer.step()
-
-        def occ_eval_fn(x):
-            density = model.geometry(x)
-            return density * (1.732 * 2 * radius / n_samples)
-
-        estimator.update_every_n_steps(step, occ_eval_fn)
-        step = step + 1
         optimizer.zero_grad()
         psnr = -10 * tc.log10(loss)
 
@@ -446,17 +375,13 @@ def train(dataset, model, optimizer, estimator):
 
         if _ % dis_rate == 0:
             # add collab cv imshow
-            cv2_imshow(colors.detach().cpu().numpy() * 255)
+            cv2_imshow(rgb_prediction.detach().cpu().numpy() * 255)
 
-
-if __name__ == "__main__":
-    # data
+if __name__ == '__main__':
     data = BlenderDataset()
-    # model
-    model = HashNeRF()
-    # optimizer
-    optimizer = tc.optim.Adam(model.params(), lr, (beta1, beta2), eps)
+    ray_o, rays_d = get_rays(data.poses, data.H, data.W, data.focal)
+    print(ray_o.shape)
+    print(rays_d.shape)
 
-    estimator = nerfacc.OccGridEstimator(roi_aabb, 128, 1)
 
-    train(data, model, optimizer, estimator)
+
