@@ -160,7 +160,37 @@ class NeRFNetwork(nn.Module):
 
         return sigma, geo_feat
 
+    def color(self, x, d, mask=None, geo_feat=None, **kwargs):
+        # x: [N, 3] in [-bound, bound]
+        # mask: [N,], bool, indicates where we actually needs to compute rgb.
+
+        x = (x + self.bound) / (2 * self.bound) # to [0, 1]
+
+        if mask is not None:
+            rgbs = torch.zeros(mask.shape[0], 3, dtype=x.dtype, device=x.device) # [N, 3]
+            # in case of empty mask
+            if not mask.any():
+                return rgbs
+            x = x[mask]
+            d = d[mask]
+            geo_feat = geo_feat[mask]
+
+        # color
+        d = (d + 1) / 2 # tcnn SH encoding requires inputs to be in [0, 1]
+        d = self.encoder_dir(d)
+
+        h = torch.cat([d, geo_feat], dim=-1)
+        h = self.color_net(h)
         
+        # sigmoid activation for rgb
+        h = torch.sigmoid(h)
+
+        if mask is not None:
+            rgbs[mask] = h.to(rgbs.dtype) # fp16 --> fp32
+        else:
+            rgbs = h
+
+        return rgbs          
     # optimizer utils
     def get_params(self, lr):
 
@@ -175,6 +205,7 @@ class NeRFNetwork(nn.Module):
             params.append({'params': self.bg_net.parameters(), 'lr': lr})
         
         return params
+    
 
 
 class BlenderDataset:
@@ -433,7 +464,7 @@ def train(model, train_loader, optimizer):
         geo_feats = torch.gather(geo_feats, dim=-2, index=z_indices.unsqueeze(-1).expand_as(geo_feats))
 
         #Do I need weights ???????? Test no need that, im in deppression anayawy.
-        
+
 
 
 if __name__ == '__main__':
