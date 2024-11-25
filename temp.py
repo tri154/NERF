@@ -3,7 +3,6 @@ import torch as tc
 import numpy as np
 
 if __name__ == "__main__":
-    a = tc.rand(3, 1)
-    b = tc.rand(3, 1)
-    c = tc.cat((a,b ), dim=0)
-    print(c.shape)
+    a = tc.rand(3, 4)
+    a = a.view(3, 2, 2)
+    print(a)

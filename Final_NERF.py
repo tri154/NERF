@@ -358,9 +358,11 @@ def train(model, train_loader, optimizer):
 
     for data in train_loader:
         rays_o, rays_d = data['rays_o'], data['rays_d']
-        pts, z_vals = sample_stratified(rays_o, rays_d, near, far, n_samples)
+        rays_o = rays_o.reshape(-1, rays_o.shape[-1])
+        rays_d = rays_d.reshape(-1, rays_d.shape[-1])
 
-        pts = pts.reshape(-1, pts.shape[-1])
+        pts, z_vals = sample_stratified(rays_o, rays_d, near, far, n_samples) # already flatten out.
+
         pts = torch.min(torch.max(pts, aabb[:3]), aabb[3:])
 
         pts_chunk = prepare_chunks(pts, chunk_size)
@@ -374,26 +376,29 @@ def train(model, train_loader, optimizer):
 
         sigmas = torch.cat(sigma_pred, dim=0)
         geo_feats = torch.cat(geo_feat_pred, dim=0)
-        sigmas = sigmas.reshape(*z_vals.shape[:2], -1)
-        geo_feats = geo_feats.reshape(*z_vals.shape[:2], -1, geo_feats.shape[-1])
+
+        #need to do that ?.
+        # sigmas = sigmas.reshape(*z_vals.shape[:2], -1) # Restore shape (H, W, n_samples).
+        # geo_feats = geo_feats.reshape(*z_vals.shape[:2], -1, geo_feats.shape[-1]) # Restore shape (H, W, n_samples, 3).
         
         with torch.no_grad():
-            deltas = z_vals[..., 1:] - z_vals[..., :-1] 
+            deltas = z_vals[..., 1:] - z_vals[..., :-1]  # (H, W, n_samples - 1)
             sample_dist = (far - near) / n_samples
-            deltas = torch.cat( (deltas, sample_dist * torch.ones_like(deltas[..., :1])) ,dim=-1) 
+            deltas = torch.cat( (deltas, sample_dist * torch.ones_like(deltas[..., :1])) ,dim=-1) # (H, W, n_samples).
 
             alphas = 1 - torch.exp(-deltas * density_scale *  sigmas) #(H, W, n_samples)
             alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [H, W, n_samples + 1]
-            weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T]
+            weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # (H, W, n_samples).
 
             z_vals_mid = (z_vals[..., :-1] + 0.5 * deltas[..., :-1]) # [H, W, n_samples - 1]
             new_z_vals = sample_pdf(z_vals_mid, weights[..., 1:-1], n_samples).detach()
             
-            new_pts =  rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * new_z_vals.unsqueeze(-1)
-            new_pts = torch.min(torch.max(new_pts, aabb[:3]), aabb[3:])
+            new_pts =  rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * new_z_vals.unsqueeze(-1) #already flatten outs.
+            new_pts = torch.min(torch.max(new_pts, aabb[:3]), aabb[3:]) 
 
         
         new_pts_chunk = prepare_chunks(new_pts, chunk_size)
+        # what if i flatten out the z_vals, pts .................. J.
 
         new_sigma_pred = []
         new_geo_feat_pred = []
@@ -401,8 +406,11 @@ def train(model, train_loader, optimizer):
             sigma, geo_feat = model.density(chunk)
             new_sigma_pred.append(sigma)
             new_geo_feat_pred.append(geo_feat)
-        new_sigmas = torch.cat(new_sigma_pred, dim=0)
+        new_sigmas = torch.cat(new_sigma_pred, dim=0) 
         new_geo_feats = torch.cat(new_geo_feat_pred, dim=0)
+
+        # new_sigmas = new_sigmas.reshape(*new_z_vals.shape[:2], -1)
+        # new_geo_feats = new_geo_feats.reshape(*new_z_vals.shape[:2], -1, new_geo_feats.shape[-1])
 
         # I suddenly felt so bad, I've been sucked. I want to finish that shiet.
         # I hate myself so bad @_@.
@@ -410,12 +418,23 @@ def train(model, train_loader, optimizer):
         # I want to say that thing, but I can't.
         # I also want to take a shower, I have to finish that.
         # should I keep this one ?, I forget to write uppercase in this sentence. is my grammar correct ? 
+        
+        z_vals = torch.cat( (z_vals, new_z_vals), dim=-1 ) # (H * W, n_samples + n_samples)
+        z_vals, z_indices = torch.sort(z_vals, dim=-1) # (H * W, n_samples + n_samples)
+        
+        #Use for what ?? ??????.
+        pts = torch.cat( (pts, new_pts), dim=-2) # (H, W, n_samples + n_samples, 3)
+        pts = torch.gather(pts, dim=-2, index=z_indices.unsqueeze(-1).expand_as(pts))
+        
+        sigmas = torch.cat((sigmas, new_sigmas), dim=-1)
+        sigmas = torch.gather(sigmas, dim=-1, index=z_indices)
 
-        z_vals = torch.cat( (z_vals, new_z_vals), dim=-1)
-        z_vals, z_indices = torch.sort(z_vals, dim=-1) # (H, W, n_samples + n_samples)
-    
-        pts = torch.cat( (pts, new_pts), dim=-1) # (H, W, n_samples, n_samples)
-        pts = torch.gather(pts, dim=-1, index=z_indices)
+        geo_feats = torch.cat((geo_feats, new_geo_feats), dim=-2)
+        geo_feats = torch.gather(geo_feats, dim=-2, index=z_indices.unsqueeze(-1).expand_as(geo_feats))
+
+        #Do I need weights ???????? Test no need that, im in deppression anayawy.
+        
+
 
 if __name__ == '__main__':
     dataset = BlenderDataset()
