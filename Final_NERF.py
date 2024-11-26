@@ -2,8 +2,9 @@ import torch
 import json
 import os
 import cv2
+from torch.optim import lr_scheduler
 import tinycuda as tcnn
-from torch import nn
+from torch import nn, optim
 import numpy as np
 from torch.amp import custom_bwd, custom_fwd
 from torch.utils.data import DataLoader, dataloader
@@ -15,6 +16,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 #training
 chunk_size = 2**14
+n_iters = 10000
 
 #opitmizer
 lr = 1e-4
@@ -160,18 +162,15 @@ class NeRFNetwork(nn.Module):
 
         return sigma, geo_feat
 
-    def color(self, x, d, mask=None, geo_feat=None, **kwargs):
+    def color(self, d, mask=None, geo_feat=None, **kwargs):
         # x: [N, 3] in [-bound, bound]
         # mask: [N,], bool, indicates where we actually needs to compute rgb.
 
-        x = (x + self.bound) / (2 * self.bound) # to [0, 1]
-
         if mask is not None:
-            rgbs = torch.zeros(mask.shape[0], 3, dtype=x.dtype, device=x.device) # [N, 3]
+            rgbs = torch.zeros(mask.shape[0], 3, dtype=geo_feat.dtype, device=geo_feat.device) # [N, 3]
             # in case of empty mask
             if not mask.any():
                 return rgbs
-            x = x[mask]
             d = d[mask]
             geo_feat = geo_feat[mask]
 
@@ -272,6 +271,7 @@ class BlenderDataset:
         index : list of indexs in image. Default: batch_size=1, only a single index.
         """
         pose = self.poses[index]
+        image = self.imgs[index]
 
         i, j = torch.meshgrid(
                 torch.arange(self.W, dtype=torch.float32).to(pose),
@@ -283,6 +283,7 @@ class BlenderDataset:
                                     -torch.ones_like(i)
                                 ], dim=-1)
 
+        directions = directions / directions.norm(dim=-1, keepdim=True)
         # Apply camera pose to directions
         rays_d = torch.sum(directions[..., None, :] * pose[:3, :3], dim=-1)
 
@@ -293,7 +294,8 @@ class BlenderDataset:
             'H': self.H,
             'W': self.W,
             'rays_o': rays_o,
-            'rays_d': rays_d
+            'rays_d': rays_d,
+            'image': image,
         }
         return res
 
@@ -384,87 +386,167 @@ def sample_pdf(bins, weights, n_samples, det=False):
 
     return samples
 
-def train(model, train_loader, optimizer):
+def train_step(rays_o, rays_d, aabb):
+
+
+    pts, z_vals = sample_stratified(rays_o, rays_d, near, far, n_samples) # already flatten out.  
+
+    pts = torch.min(torch.max(pts, aabb[:3]), aabb[3:])
+
+    #if collab can handle it, remove.
+    pts_chunk = prepare_chunks(pts.reshape(-1, pts.shape[-1]), chunk_size)
+
+    sigma_pred = []
+    geo_feat_pred = []
+    for chunk in pts_chunk:
+        sigma, geo_feat = model.density(chunk)
+        sigma_pred.append(sigma)
+        geo_feat_pred.append(geo_feat)
+
+    sigmas = torch.cat(sigma_pred, dim=0) # (H * W * n_samples)
+    geo_feats = torch.cat(geo_feat_pred, dim=0) #(H * W * n_samples, 3)
+    
+    sigmas = sigmas.view(*pts.shape[:-1], -1)
+    geo_feats = geo_feats.view_as(pts)
+
+    #need to do that ?. actually Yes. But H * W, n_samples, sigmas's having redundant dimension. 
+    # sigmas = sigmas.reshape(*z_vals.shape[:2], -1) # Restore shape (H, W, n_samples).
+    # geo_feats = geo_feats.reshape(*z_vals.shape[:2], -1, geo_feats.shape[-1]) # Restore shape (H, W, n_samples, 3).
+    
+    with torch.no_grad():
+        deltas = z_vals[..., 1:] - z_vals[..., :-1]  # (H * W, n_samples - 1)
+        sample_dist = (far - near) / n_samples
+        deltas = torch.cat( (deltas, sample_dist * torch.ones_like(deltas[..., :1])) ,dim=-1) # (H * W, n_samples).
+
+        alphas = 1 - torch.exp(-deltas * density_scale *  sigmas.squeeze(-1)) #(H * W, n_samples)
+        alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [H * W, n_samples + 1]
+        weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # (H * W, n_samples).
+
+        z_vals_mid = (z_vals[..., :-1] + 0.5 * deltas[..., :-1]) # [H * W, n_samples - 1]
+        new_z_vals = sample_pdf(z_vals_mid, weights[..., 1:-1], n_samples).detach() # (H * W, n_samples, 3)
+        
+        new_pts =  rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * new_z_vals.unsqueeze(-1) #already flatten outs.(H * W, n_samples, 3)
+        new_pts = torch.min(torch.max(new_pts, aabb[:3]), aabb[3:]) 
+
+    
+    #You think you can prepare chunk ??????? NOOOO. new_pts is not on its shape.
+
+    new_pts_chunk = prepare_chunks(new_pts.reshape(-1, new_pts.shape[-1]), chunk_size)
+    # what if i flatten out the z_vals, pts .................. J.
+
+    new_sigma_pred = []
+    new_geo_feat_pred = []
+    for chunk in new_pts_chunk:
+        sigma, geo_feat = model.density(chunk)
+        new_sigma_pred.append(sigma)
+        new_geo_feat_pred.append(geo_feat)
+    new_sigmas = torch.cat(new_sigma_pred, dim=0) 
+    new_geo_feats = torch.cat(new_geo_feat_pred, dim=0)
+
+    new_sigmas = new_sigmas.view(*new_pts.shape[:-1], -1) #(H * w, n_samples, 1)
+    new_geo_feats = new_geo_feats.view_as(new_pts) #(H* W, n_samples, 3)
+
+
+    
+    # new_sigmas = new_sigmas.reshape(*new_z_vals.shape[:2], -1)
+    # new_geo_feats = new_geo_feats.reshape(*new_z_vals.shape[:2], -1, new_geo_feats.shape[-1])
+
+    # I suddenly felt so bad, I've been sucked. I want to finish that shiet.
+    # I hate myself so bad @_@.
+    # What I've done ? nothing, feel so bad.
+    # I want to say that thing, but I can't.
+    # I also want to take a shower, I have to finish that.
+    # should I keep this one ?, I forget to write uppercase in this sentence. is my grammar correct ? 
+    
+    z_vals = torch.cat( (z_vals, new_z_vals), dim=-1 ) # (H * W, n_samples + n_samples)
+    z_vals, z_indices = torch.sort(z_vals, dim=-1) # (H * W, n_samples + n_samples)
+    
+    #Use for what ?? ??????. I don't know ??? for nothing bruhhhh, I gonna comment it out.
+    # pts = torch.cat( (pts, new_pts), dim=-2) # (H * W, n_samples + n_samples, 3)
+    # pts = torch.gather(pts, dim=-2, index=z_indices.unsqueeze(-1).expand_as(pts))
+    
+    sigmas = torch.cat((sigmas, new_sigmas), dim=-2) # (H * W, n_samples + n_samples, 1)
+    sigmas = torch.gather(sigmas, dim=-2, index=z_indices.unsqueeze(-1)) #(H * W, n_samples + n_samples, 1)
+
+    geo_feats = torch.cat((geo_feats, new_geo_feats), dim=-2)  #(H * W, n_samples + n_samples, 16 ??)
+    geo_feats = torch.gather(geo_feats, dim=-2, index=z_indices.unsqueeze(-1).expand_as(geo_feats))
+
+    # Do I need weights ???????? Test no need that, im in deppression anayawy. Yes I need it, so dump.
+    # understand mask, use mask continue to implement. HERE  I'm heeeeere.
+
+    deltas = z_vals[..., 1:] - z_vals[..., :-1]  # (H * W, n_samples - 1)
+    sample_dist = (far - near) / n_samples
+    deltas = torch.cat( (deltas, sample_dist * torch.ones_like(deltas[..., :1])) ,dim=-1) # (H * W, n_samples).
+
+    alphas = 1 - torch.exp(-deltas * density_scale * sigmas.squeeze(-1)) #(H * W, n_samples)
+    alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [H * W, n_samples + 1]
+    weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # (H * W, n_samples).
+
+    #damn 
+    dir = rays_d.view(-1, 1, 3) 
+    dir = dir.expand(dir.shape[0], n_samples + n_samples, dir.shape[-1])# (H * W, n_samples + n_samples, 3)
+
+    #sigmas for what ???
+    # sigmas = sigmas.view(-1, sigmas.shape[-1]) # (H * W * (n_samples + n_samples), 1)
+    geo_feats = geo_feats.view((-1, geo_feats.shape[-1])) # (H * W * (n_samples + n_samples), 1)
+
+    mask = weights > 1e-4
+    #def color(self, d, mask=None, geo_feat=None, **kwargs):
+    # How mask function ?
+    rgbs = model.color(dir.reshape(-1, 3), mask, geo_feats)
+
+    #do you think the gpu of collab can handle it without using chunk ?, I don't know. 800 * 800 * 128 = 1x Million nahhh.
+    # I bet on you bro. you have to produce a good results, I bet on you.
+    rgbs = rgbs.view_as(dir)
+
+    weights_sum = weights.sum(dim=-1)
+    #calculate depth. Implement later.
+
+    #calculate color:
+    image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) #inner: (H * W, 3)
+
+    bg_color = 1
+    image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
+
+    return image
+
+
+
+def train(model, train_loader, optimizer, scheduler, scaler):
     aabb = torch.FloatTensor([-bound, -bound, -bound, bound, bound]).to(device)
+    lr_scheduler = scheduler(optimizer)
 
     for data in train_loader:
         rays_o, rays_d = data['rays_o'], data['rays_d']
+        gt_image = data['image']
         rays_o = rays_o.reshape(-1, rays_o.shape[-1])
         rays_d = rays_d.reshape(-1, rays_d.shape[-1])
 
-        pts, z_vals = sample_stratified(rays_o, rays_d, near, far, n_samples) # already flatten out.
-
-        pts = torch.min(torch.max(pts, aabb[:3]), aabb[3:])
-
-        pts_chunk = prepare_chunks(pts, chunk_size)
-
-        sigma_pred = []
-        geo_feat_pred = []
-        for chunk in pts_chunk:
-            sigma, geo_feat = model.density(chunk)
-            sigma_pred.append(sigma)
-            geo_feat_pred.append(geo_feat)
-
-        sigmas = torch.cat(sigma_pred, dim=0)
-        geo_feats = torch.cat(geo_feat_pred, dim=0)
-
-        #need to do that ?.
-        # sigmas = sigmas.reshape(*z_vals.shape[:2], -1) # Restore shape (H, W, n_samples).
-        # geo_feats = geo_feats.reshape(*z_vals.shape[:2], -1, geo_feats.shape[-1]) # Restore shape (H, W, n_samples, 3).
         
-        with torch.no_grad():
-            deltas = z_vals[..., 1:] - z_vals[..., :-1]  # (H, W, n_samples - 1)
-            sample_dist = (far - near) / n_samples
-            deltas = torch.cat( (deltas, sample_dist * torch.ones_like(deltas[..., :1])) ,dim=-1) # (H, W, n_samples).
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast(enabled=True):
+            pred_image = train_step(rays_o, rays_d, aabb)
 
-            alphas = 1 - torch.exp(-deltas * density_scale *  sigmas) #(H, W, n_samples)
-            alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [H, W, n_samples + 1]
-            weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # (H, W, n_samples).
+            loss = nn.functional.mse_loss(pred_image, gt_image).mean(-1)
+            loss = loss.mean()
 
-            z_vals_mid = (z_vals[..., :-1] + 0.5 * deltas[..., :-1]) # [H, W, n_samples - 1]
-            new_z_vals = sample_pdf(z_vals_mid, weights[..., 1:-1], n_samples).detach()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        lr_scheduler.step()
             
-            new_pts =  rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * new_z_vals.unsqueeze(-1) #already flatten outs.
-            new_pts = torch.min(torch.max(new_pts, aabb[:3]), aabb[3:]) 
 
-        
-        new_pts_chunk = prepare_chunks(new_pts, chunk_size)
-        # what if i flatten out the z_vals, pts .................. J.
 
-        new_sigma_pred = []
-        new_geo_feat_pred = []
-        for chunk in new_pts_chunk:
-            sigma, geo_feat = model.density(chunk)
-            new_sigma_pred.append(sigma)
-            new_geo_feat_pred.append(geo_feat)
-        new_sigmas = torch.cat(new_sigma_pred, dim=0) 
-        new_geo_feats = torch.cat(new_geo_feat_pred, dim=0)
 
-        # new_sigmas = new_sigmas.reshape(*new_z_vals.shape[:2], -1)
-        # new_geo_feats = new_geo_feats.reshape(*new_z_vals.shape[:2], -1, new_geo_feats.shape[-1])
 
-        # I suddenly felt so bad, I've been sucked. I want to finish that shiet.
-        # I hate myself so bad @_@.
-        # What I've done ? nothing, feel so bad.
-        # I want to say that thing, but I can't.
-        # I also want to take a shower, I have to finish that.
-        # should I keep this one ?, I forget to write uppercase in this sentence. is my grammar correct ? 
-        
-        z_vals = torch.cat( (z_vals, new_z_vals), dim=-1 ) # (H * W, n_samples + n_samples)
-        z_vals, z_indices = torch.sort(z_vals, dim=-1) # (H * W, n_samples + n_samples)
-        
-        #Use for what ?? ??????.
-        pts = torch.cat( (pts, new_pts), dim=-2) # (H, W, n_samples + n_samples, 3)
-        pts = torch.gather(pts, dim=-2, index=z_indices.unsqueeze(-1).expand_as(pts))
-        
-        sigmas = torch.cat((sigmas, new_sigmas), dim=-1)
-        sigmas = torch.gather(sigmas, dim=-1, index=z_indices)
 
-        geo_feats = torch.cat((geo_feats, new_geo_feats), dim=-2)
-        geo_feats = torch.gather(geo_feats, dim=-2, index=z_indices.unsqueeze(-1).expand_as(geo_feats))
 
-        #Do I need weights ???????? Test no need that, im in deppression anayawy.
 
+
+
+
+    
 
 
 if __name__ == '__main__':
@@ -473,6 +555,9 @@ if __name__ == '__main__':
 
     model = NeRFNetwork()
 
-    optimizer = 
+    optimizer = lambda model: torch.optim.Adam(model.get_params(lr), betas=(0.9, 0.99), eps=1e-15)
+    scheduler = lambda optimizer: torch.optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / n_iters, 1))
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
+
 
     
